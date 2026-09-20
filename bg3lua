@@ -506,6 +506,16 @@ class BG3Lua:
                 for waiter in waiters:
                     waiter.put(("error", e))
 
+                # An idle REPL is blocked in input() and would otherwise sit
+                # at a dead prompt forever -- which leaves an orphaned window
+                # behind when the extender opened the terminal for us.
+                if not waiters and _prompt["active"]:
+                    emit("bg3lua: connection closed by the game", sys.stderr)
+                    try:
+                        os.close(0)  # makes input() raise EOFError
+                    except OSError:
+                        pass
+
     def _start_reader(self):
         stop_event = threading.Event()
         self._reader_stop = stop_event
