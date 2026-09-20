@@ -1,0 +1,763 @@
+#!/usr/bin/env python3
+"""
+bg3lua - tiny terminal REPL for the BG3 Script Extender Lua debugger.
+
+No protobuf library required; this implements only the small protobuf subset
+needed for connect/evaluate/debug-output.
+
+Usage:
+    ./bg3lua
+    ./bg3lua -e 'print(Osi.GetLevel(Osi.GetHostCharacter()))'
+    ./bg3lua -e '_D(Ext.Entity.Get(Osi.GetHostCharacter()).Stats)'
+    ./bg3lua --client
+    ./bg3lua --host 127.0.0.1 --port 9998
+
+Interactive commands:
+    :server          evaluate in server context (default)
+    :client          evaluate in client context
+    :expr CODE       evaluate CODE as a raw expression (no REPL wrapper)
+    =CODE            shorthand for :expr CODE
+    :quit / :q       exit
+
+Input is compiled in-game as its own chunk, so it behaves like any Lua REPL:
+globals persist between lines, `local` is scoped to the line that declares it,
+and a line that evaluates to something has its value printed automatically.
+
+Requires "EnableLuaDebugger": true in ScriptExtenderSettings.json.
+"""
+
+import argparse
+import os
+import socket
+import struct
+import sys
+import threading
+import queue
+import re
+
+try:
+    import readline  # enables terminal history/editing
+except ImportError:
+    readline = None
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 9998
+
+# Protocol spoken by current BG3SE builds.  The server reports its own version
+# in the connect response, and connect() transparently retries with it on a
+# mismatch -- but each retry costs a reconnect to a single-client server, so
+# the default should track whatever is actually shipping.
+PREFERRED_PROTOCOL = 4
+
+# Seconds to wait for a reply to an evaluate request.  BG3SE simply never
+# answers if no Lua context is loaded (e.g. sitting at the main menu), so this
+# must be bounded or the REPL hangs forever.
+EVAL_TIMEOUT = 30.0
+
+# Sanity bound on an incoming packet.  _D() of a real entity runs to hundreds
+# of KB, so this only exists to catch a desynced stream, not to limit output.
+MAX_PACKET = 16 * 1024 * 1024
+
+# LuaDebug.proto
+CTX_SERVER = 0
+CTX_CLIENT = 1
+
+# BG3SE ignores this flag: it always compiles the payload as an expression,
+# first as `return <code>` and then as `local x = <code>`.  Statements
+# therefore cannot be sent directly -- see make_repl_chunk().
+EVAL_AS_STATEMENT = 1 << 0
+DISALLOW_VARIABLE_REFS = 1 << 1
+
+STATUS = {
+    0: "SUCCESS",
+    1: "NOT_IN_PAUSE",
+    2: "NO_DEBUGGEE",
+    3: "INVALID_CONTINUE_ACTION",
+    4: "IN_PAUSE",
+    5: "EVAL_ENGINE_NOT_READY",
+    6: "EVAL_FAILED",
+    7: "NO_SUCH_FILE",
+}
+
+VALUE_TYPES = {
+    0: "nil",
+    1: "boolean",
+    2: "integer",
+    3: "float",
+    4: "string",
+    5: "table",
+    6: "function",
+    7: "userdata",
+    8: "thread",
+    9: "unknown",
+    11: "none",
+}
+
+# ANSI highlighting.  We intentionally highlight the JSON/Lua-ish format that
+# BG3SE's _D() emits instead of reparsing/reformatting it through jq, so output
+# remains byte-for-byte structurally familiar and mixed log text still works.
+RESET = "\x1b[0m"
+DIM = "\x1b[2m"
+BOLD = "\x1b[1m"
+CYAN = "\x1b[36m"
+GREEN = "\x1b[32m"
+YELLOW = "\x1b[33m"
+MAGENTA = "\x1b[35m"
+RED = "\x1b[31m"
+BLUE = "\x1b[34m"
+
+# Tokenizer for _D()-style output.  Strings are matched first so numbers and
+# keywords inside quoted strings are never recolored.
+_HILITE_RE = re.compile(
+    r'("(?:\\.|[^"\\])*")'
+    r'|(?<![\w.])(-?(?:\d+\.\d+|\d+)(?:[eE][+-]?\d+)?)(?![\w.])'
+    r'|\b(true|false|nil|null)\b'
+    r'|([{}\[\],:])'
+)
+
+# BG3SE reports our generated chunk as [string "?"]; rewrite it to something
+# that reads like a console prompt.  Line numbers are already correct.
+_CHUNKNAME_RE = re.compile(r'\[string "\?"\]:')
+
+
+def clean_error(text, keep_traceback=False):
+    """Tidy a Lua error coming back from BG3SE."""
+    text = _CHUNKNAME_RE.sub("console:", text)
+    if keep_traceback:
+        return text
+    # Lua names each traceback frame after the whole chunk, and our chunk is
+    # the generated wrapper -- so the traceback is a dozen lines of boilerplate
+    # around a message that already carries the right line number.
+    return text.split("\nstack traceback:", 1)[0].rstrip()
+
+
+def color_enabled(stream):
+    return hasattr(stream, "isatty") and stream.isatty() and "NO_COLOR" not in os.environ
+
+
+def highlight_dump(text, stream=sys.stdout):
+    if not color_enabled(stream):
+        return text
+
+    def repl(m):
+        string, number, keyword, punct = m.groups()
+        if string is not None:
+            # A quoted token followed by ':' is a key.
+            is_key = bool(re.match(r'\s*:', text[m.end():]))
+            return (CYAN if is_key else GREEN) + string + RESET
+        if number is not None:
+            return YELLOW + number + RESET
+        if keyword is not None:
+            return MAGENTA + keyword + RESET
+        if punct is not None:
+            return DIM + punct + RESET
+        return m.group(0)
+
+    return _HILITE_RE.sub(repl, text)
+
+
+# ---------- terminal output that coexists with the readline prompt ----------
+
+_output_lock = threading.Lock()
+_prompt = {"active": False, "text": ""}
+
+
+def emit(msg, stream):
+    """Print msg, redrawing the input prompt if one is on screen."""
+    if not msg.endswith("\n"):
+        msg += "\n"
+    with _output_lock:
+        redraw = _prompt["active"] and color_enabled(sys.stdout)
+        if redraw:
+            sys.stdout.write("\r\x1b[2K")
+            sys.stdout.flush()
+        stream.write(msg)
+        stream.flush()
+        if redraw:
+            buf = readline.get_line_buffer() if readline is not None else ""
+            sys.stdout.write(_prompt["text"] + buf)
+            sys.stdout.flush()
+
+
+# ---------- minimal protobuf encoder ----------
+
+def enc_varint(n: int) -> bytes:
+    if n < 0:
+        n &= (1 << 64) - 1
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7f) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def pb_key(field: int, wire: int) -> bytes:
+    return enc_varint((field << 3) | wire)
+
+
+def pb_varint(field: int, value: int) -> bytes:
+    if value == 0:
+        return b""  # proto3 omits defaults
+    return pb_key(field, 0) + enc_varint(value)
+
+
+def pb_bytes(field: int, value: bytes) -> bytes:
+    return pb_key(field, 2) + enc_varint(len(value)) + value
+
+
+def pb_string(field: int, value: str) -> bytes:
+    return pb_bytes(field, value.encode("utf-8"))
+
+
+def make_connect(seq: int, version: int) -> bytes:
+    # DebuggerToBackend { seq_no=1; connect { protocol_version=... } }
+    return pb_varint(1, seq) + pb_bytes(3, pb_varint(1, version))
+
+
+def make_evaluate(seq: int, context: int, expression: str, statement: bool) -> bytes:
+    # DbgEvaluate: context=1, expression=2, frame=3, flags=4
+    ev = pb_varint(1, context)
+    ev += pb_string(2, expression)
+
+    # frame=-1 means "evaluate in the global context".  If this field is
+    # omitted protobuf defaults it to 0, which makes BG3SE treat the request
+    # as evaluation in stack frame 0.
+    ev += pb_varint(3, -1)
+    ev += pb_varint(4, EVAL_AS_STATEMENT if statement else 0)
+
+    # DebuggerToBackend.evaluate = field 7
+    return pb_varint(1, seq) + pb_bytes(7, ev)
+
+
+# ---------- building the REPL chunk ----------
+
+def lua_long_string(src: str) -> str:
+    """Quote src as a Lua long string, picking a bracket level it can't close."""
+    level = 0
+    while ("]" + "=" * level + "]") in src:
+        level += 1
+    eq = "=" * level
+    # A newline directly after the opening bracket is skipped by Lua, so line 1
+    # of src stays line 1.  The trailing newline keeps a src ending in ']' from
+    # forming the closing bracket early.
+    return "[" + eq + "[\n" + src + "\n]" + eq + "]"
+
+
+def make_repl_chunk(code: str) -> str:
+    """Wrap code so it runs as its own chunk with normal Lua REPL semantics.
+
+    BG3SE only ever compiles the payload as an expression, so the input is
+    handed to the in-game load() instead: first as `return <code>` to capture a
+    value, falling back to plain `<code>` for statements.  Because load()
+    compiles the user's text as a top-level chunk, locals scope correctly and
+    error line numbers refer to what was typed rather than to this wrapper.
+    """
+    return """(function()
+local __src = %s
+local __f, __e = load("return " .. __src)
+if not __f then __f, __e = load(__src) end
+if not __f then error(__e, 0) end
+local __r = table.pack(__f())
+for __i = 1, __r.n do
+local __v = __r[__i]
+if type(__v) == "table" and _D then _D(__v) else print(tostring(__v)) end
+end
+end)()""" % lua_long_string(code)
+
+
+# ---------- minimal protobuf decoder ----------
+
+def dec_varint(buf: bytes, pos: int):
+    value = 0
+    shift = 0
+    while True:
+        if pos >= len(buf):
+            raise ValueError("truncated varint")
+        b = buf[pos]
+        pos += 1
+        value |= (b & 0x7f) << shift
+        if not (b & 0x80):
+            return value, pos
+        shift += 7
+        if shift > 70:
+            raise ValueError("invalid varint")
+
+
+def as_signed64(value: int) -> int:
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def parse_fields(buf: bytes):
+    """Return [(field_number, wire_type, value), ...]."""
+    out = []
+    pos = 0
+    while pos < len(buf):
+        key, pos = dec_varint(buf, pos)
+        field = key >> 3
+        wire = key & 7
+
+        if wire == 0:
+            value, pos = dec_varint(buf, pos)
+        elif wire == 1:
+            if pos + 8 > len(buf):
+                raise ValueError("truncated fixed64")
+            value = buf[pos:pos + 8]
+            pos += 8
+        elif wire == 2:
+            length, pos = dec_varint(buf, pos)
+            end = pos + length
+            if end > len(buf):
+                raise ValueError("truncated length-delimited field")
+            value = buf[pos:end]
+            pos = end
+        elif wire == 5:
+            if pos + 4 > len(buf):
+                raise ValueError("truncated fixed32")
+            value = buf[pos:pos + 4]
+            pos += 4
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire}")
+
+        out.append((field, wire, value))
+    return out
+
+
+def field_first(fields, number, default=None):
+    for f, _w, v in fields:
+        if f == number:
+            return v
+    return default
+
+
+def decode_text(b):
+    return b.decode("utf-8", errors="replace")
+
+
+def format_number(raw: bytes) -> str:
+    # BG3SE sends this as a 32-bit float; tolerate a double from other builds.
+    if len(raw) == 4:
+        value = struct.unpack("<f", raw)[0]
+    elif len(raw) == 8:
+        value = struct.unpack("<d", raw)[0]
+    else:
+        return "<float?>"
+    return str(int(value)) if value.is_integer() else repr(value)
+
+
+def decode_msg_value(buf: bytes):
+    f = parse_fields(buf)
+    type_id = field_first(f, 1, 0)
+
+    if type_id == 0:
+        return "nil"
+    if type_id == 1:
+        return "true" if field_first(f, 2, 0) else "false"
+    if type_id == 2:
+        return str(as_signed64(field_first(f, 3, 0)))
+    if type_id == 3:
+        raw = field_first(f, 4)
+        return format_number(raw) if raw else "<float?>"
+    if type_id == 4:
+        return decode_text(field_first(f, 5, b""))
+
+    typename = VALUE_TYPES.get(type_id, f"type-{type_id}")
+    refbuf = field_first(f, 6)
+    if refbuf:
+        ref = as_signed64(field_first(parse_fields(refbuf), 1, 0))
+        return f"<{typename} ref={ref}>"
+    return f"<{typename}>"
+
+
+# ---------- BG3SE socket ----------
+
+class BG3Lua:
+    def __init__(self, host, port, protocol=PREFERRED_PROTOCOL, traceback=False):
+        self.host = host
+        self.port = port
+        self.preferred_protocol = protocol
+        self.show_traceback = traceback
+        self.sock = None
+        self.seq = 1
+        self.protocol = None
+        self.server_loaded = False
+        self.client_loaded = False
+        self.saw_context_update = False
+        self._reader = None
+        self._reader_stop = None
+        self._pending = {}
+        self._pending_lock = threading.Lock()
+        self._async_error = None
+
+    def _open(self):
+        self.sock = socket.create_connection((self.host, self.port), timeout=5.0)
+        self.sock.settimeout(None)
+        self.seq = 1
+
+    def close(self):
+        if self._reader_stop is not None:
+            self._reader_stop.set()
+
+        sock = self.sock
+        self.sock = None
+        if sock is not None:
+            # BG3SE accepts one debugger frontend at a time and blocks in recv()
+            # for that connection.  Under Wine/Proton a graceful FIN from a
+            # process with another thread blocked in recv() has proven unreliable.
+            # SO_LINGER {on,0} makes close() send RST, which forces BG3SE's recv()
+            # to return immediately and releases the debugger slot.
+            try:
+                sock.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_LINGER,
+                    struct.pack("ii", 1, 0)
+                )
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        reader = self._reader
+        self._reader = None
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=1.0)
+
+    def _send_packet(self, payload: bytes):
+        sock = self.sock
+        if sock is None:
+            raise ConnectionError("not connected to the BG3SE debugger")
+        # BG3SE framing is a native little-endian uint32 containing the TOTAL
+        # packet size (protobuf bytes + the 4-byte length field).
+        sock.sendall(struct.pack("<I", len(payload) + 4) + payload)
+
+    @staticmethod
+    def _recv_exact_from(sock, n):
+        data = bytearray()
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError("BG3SE debugger closed the connection")
+            data.extend(chunk)
+        return bytes(data)
+
+    @classmethod
+    def _recv_packet_from(cls, sock):
+        total = struct.unpack("<I", cls._recv_exact_from(sock, 4))[0]
+        if total < 4 or total > MAX_PACKET:
+            raise RuntimeError(f"invalid BG3SE debugger packet size {total}")
+        return cls._recv_exact_from(sock, total - 4)
+
+    def _recv_packet(self):
+        sock = self.sock
+        if sock is None:
+            raise ConnectionError("not connected to the BG3SE debugger")
+        return self._recv_packet_from(sock)
+
+    def _decode_backend(self, payload):
+        fields = parse_fields(payload)
+        seq = field_first(fields, 1, 0)
+        reply = field_first(fields, 2, 0)
+
+        # oneof BackendToDebugger.msg fields 3..12
+        for field, wire, value in fields:
+            if field >= 3 and wire == 2:
+                return seq, reply, field, value
+        return seq, reply, None, None
+
+    def _dispatch_context_update(self, body):
+        f = parse_fields(body)
+        ctx = field_first(f, 1, 0)
+        status = field_first(f, 2, 0)
+        self.saw_context_update = True
+        if ctx == CTX_SERVER:
+            self.server_loaded = (status == 1)
+        else:
+            self.client_loaded = (status == 1)
+
+    def _reader_loop(self, sock, stop_event):
+        try:
+            while not stop_event.is_set():
+                payload = self._recv_packet_from(sock)
+                _seq, reply, kind, body = self._decode_backend(payload)
+
+                if kind == 8:  # BkDebugOutput -- asynchronous console/log output
+                    self._print_debug_output(body)
+                    continue
+
+                if kind == 6:  # BkContextUpdated
+                    self._dispatch_context_update(body)
+                    continue
+
+                if reply:
+                    with self._pending_lock:
+                        waiter = self._pending.get(reply)
+                    if waiter is not None:
+                        waiter.put((kind, body))
+                        continue
+
+                # Other unsolicited debugger events aren't useful to the REPL.
+        except Exception as e:
+            if not stop_event.is_set():
+                self._async_error = e
+                with self._pending_lock:
+                    waiters = list(self._pending.values())
+                for waiter in waiters:
+                    waiter.put(("error", e))
+
+    def _start_reader(self):
+        stop_event = threading.Event()
+        self._reader_stop = stop_event
+        sock = self.sock
+        self._reader = threading.Thread(
+            target=self._reader_loop,
+            args=(sock, stop_event),
+            name="bg3lua-reader",
+            daemon=True,
+        )
+        self._reader.start()
+
+    def _connect_once(self, version):
+        self._open()
+        request_seq = self.seq
+        self._send_packet(make_connect(request_seq, version))
+        self.seq += 1
+
+        # BG3SE's debugger server is deliberately single-client: accept(),
+        # then a blocking MessageLoop(), then accept() again.  A second TCP
+        # connect can therefore succeed into the listen backlog while BG3SE
+        # is still attached to a stale first client.  Never hang forever in
+        # that state.
+        self.sock.settimeout(10.0)
+        try:
+            while True:
+                _seq, reply, kind, body = self._decode_backend(self._recv_packet())
+
+                if kind == 3:  # BkConnectResponse
+                    server_version = field_first(parse_fields(body), 1, 0)
+                    self.sock.settimeout(None)
+                    return server_version
+
+                elif kind == 6:  # BkContextUpdated
+                    self._dispatch_context_update(body)
+
+                elif kind == 8:  # BkDebugOutput
+                    self._print_debug_output(body)
+
+                elif kind == 9 and reply == request_seq:  # BkResult
+                    status = field_first(parse_fields(body), 1, 0)
+                    raise RuntimeError(f"connect failed: {STATUS.get(status, status)}")
+        except socket.timeout:
+            self.close()
+            raise RuntimeError(
+                "TCP connected, but BG3SE did not answer the debugger handshake. "
+                "The connection reached the listen backlog but was never serviced -- "
+                "usually another bg3lua/debugger client is still attached."
+            )
+
+    def connect(self):
+        version = self.preferred_protocol
+        try:
+            actual = self._connect_once(version)
+        except Exception:
+            self.close()
+            raise
+
+        if actual != version:
+            self.close()
+            actual2 = self._connect_once(actual)
+            if actual2 != actual:
+                self.close()
+                raise RuntimeError(
+                    f"debugger protocol changed while connecting ({actual} -> {actual2})"
+                )
+
+        self.protocol = actual
+        self._start_reader()
+
+    def _print_debug_output(self, body):
+        f = parse_fields(body)
+        msg = decode_text(field_first(f, 1, b""))
+        severity = field_first(f, 2, 0)
+        stream = sys.stderr if severity in (1, 2) else sys.stdout
+        if severity in (1, 2) and color_enabled(stream):
+            msg = RED + msg + RESET
+        else:
+            msg = highlight_dump(msg, stream)
+        emit(msg, stream)
+
+    def _check_async_error(self):
+        if self._async_error is not None:
+            raise self._async_error
+
+    def evaluate(self, code: str, context=CTX_SERVER, raw_expression=False):
+        """Run code in the game.  Returns True on success.
+
+        Unless raw_expression is set, the input is compiled in-game as its own
+        chunk and any resulting values are printed there, so statements,
+        multi-line input and persistent globals all behave as in a Lua REPL.
+        """
+        self._check_async_error()
+        wire_code = code if raw_expression else make_repl_chunk(code)
+
+        # Only the reader thread ever reads from the socket after connect().
+        # Register our reply queue BEFORE sending so a fast response can't race us.
+        request_seq = self.seq
+        self.seq += 1
+        waiter = queue.Queue()
+
+        with self._pending_lock:
+            self._pending[request_seq] = waiter
+
+        try:
+            self._send_packet(make_evaluate(request_seq, context, wire_code, False))
+
+            while True:
+                try:
+                    kind, body = waiter.get(timeout=EVAL_TIMEOUT)
+                except queue.Empty:
+                    raise RuntimeError(
+                        f"no reply from BG3SE after {EVAL_TIMEOUT:g}s; the Lua "
+                        "context is probably not loaded (is a save running?)"
+                    )
+
+                if kind == "error":
+                    raise body
+
+                if kind == 5:  # BkEvaluateResponse
+                    f = parse_fields(body)
+                    err = field_first(f, 2, b"")
+                    if err:
+                        text = clean_error(decode_text(err), self.show_traceback)
+                        emit(RED + text + RESET if color_enabled(sys.stderr) else text,
+                             sys.stderr)
+                        return False
+
+                    result = field_first(f, 1)
+                    # In wrapped mode the chunk prints its own results.
+                    if result is not None and raw_expression:
+                        emit(highlight_dump(decode_msg_value(result), sys.stdout),
+                             sys.stdout)
+                    return True
+
+                if kind == 9:  # BkResult
+                    status = field_first(parse_fields(body), 1, 0)
+                    if status != 0:
+                        emit(f"BG3SE: {STATUS.get(status, status)}", sys.stderr)
+                        return False
+                    return True
+        finally:
+            with self._pending_lock:
+                self._pending.pop(request_seq, None)
+
+
+def repl(bg, initial_context):
+    context = initial_context
+    name = "server" if context == CTX_SERVER else "client"
+
+    print(f"Connected to BG3SE Lua debugger (protocol {bg.protocol}).")
+    print(f"Context: {name}.  :server / :client / :expr CODE / :quit")
+
+    while True:
+        if color_enabled(sys.stdout):
+            prompt_color = BLUE if name == "server" else MAGENTA
+            prompt_text = f"{prompt_color}{BOLD}{name}> {RESET}"
+        else:
+            prompt_text = f"{name}> "
+
+        with _output_lock:
+            _prompt["active"] = True
+            _prompt["text"] = prompt_text
+        try:
+            line = input(prompt_text)
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            continue
+        finally:
+            with _output_lock:
+                _prompt["active"] = False
+
+        line = line.strip()
+        if not line:
+            continue
+
+        if line in (":q", ":quit", ":exit"):
+            break
+        if line == ":server":
+            context, name = CTX_SERVER, "server"
+            continue
+        if line == ":client":
+            context, name = CTX_CLIENT, "client"
+            continue
+
+        try:
+            if line.startswith(":expr "):
+                bg.evaluate(line[6:].lstrip(), context, raw_expression=True)
+            elif line.startswith("="):
+                bg.evaluate(line[1:].lstrip(), context, raw_expression=True)
+            else:
+                bg.evaluate(line, context)
+        except (ConnectionError, OSError, RuntimeError, ValueError) as e:
+            print(f"bg3lua: {e}", file=sys.stderr)
+            break
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Terminal client for the BG3SE Lua debugger")
+    ap.add_argument("--host", default=DEFAULT_HOST)
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--protocol", type=int, default=PREFERRED_PROTOCOL,
+                    help=f"debugger protocol to request (default {PREFERRED_PROTOCOL})")
+    ap.add_argument("--client", action="store_true", help="use client Lua context")
+    ap.add_argument("--traceback", action="store_true",
+                    help="show the raw Lua stack traceback on errors")
+    one_shot = ap.add_mutually_exclusive_group()
+    one_shot.add_argument("-e", "--execute", metavar="LUA",
+                          help="run one line of Lua and exit")
+    one_shot.add_argument("-x", "--expression", metavar="LUA",
+                          help="evaluate one raw expression and exit")
+    args = ap.parse_args()
+
+    context = CTX_CLIENT if args.client else CTX_SERVER
+    bg = BG3Lua(args.host, args.port, args.protocol, args.traceback)
+
+    try:
+        bg.connect()
+
+        # Only trust this if BG3SE actually told us; it stays silent about
+        # contexts that were already loaded before we attached.
+        loaded = bg.client_loaded if context == CTX_CLIENT else bg.server_loaded
+        if bg.saw_context_update and not loaded:
+            which = "client" if context == CTX_CLIENT else "server"
+            print(f"warning: BG3SE reports the {which} Lua context is not loaded",
+                  file=sys.stderr)
+
+        if args.execute is not None:
+            return 0 if bg.evaluate(args.execute, context) else 1
+
+        if args.expression is not None:
+            return 0 if bg.evaluate(args.expression, context, raw_expression=True) else 1
+
+        repl(bg, context)
+        return 0
+
+    except (ConnectionRefusedError, TimeoutError, socket.timeout):
+        print(
+            f"bg3lua: cannot connect to {args.host}:{args.port}; "
+            "is BG3 running with EnableLuaDebugger=true?",
+            file=sys.stderr,
+        )
+        return 2
+    except (ConnectionError, OSError, RuntimeError, ValueError) as e:
+        print(f"bg3lua: {e}", file=sys.stderr)
+        return 2
+    finally:
+        bg.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
