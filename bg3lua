@@ -161,6 +161,31 @@ def highlight_dump(text, stream=sys.stdout):
 _output_lock = threading.Lock()
 _prompt = {"active": False, "text": ""}
 
+# Saved so a hard exit from the reader thread cannot leave the user's shell
+# with echo disabled.
+_saved_termios = None
+
+
+def save_terminal():
+    global _saved_termios
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+        _saved_termios = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        _saved_termios = None
+
+
+def restore_terminal():
+    if _saved_termios is None:
+        return
+    try:
+        import termios
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _saved_termios)
+    except Exception:
+        pass
+
 
 def emit(msg, stream):
     """Print msg, redrawing the input prompt if one is on screen."""
@@ -509,12 +534,12 @@ class BG3Lua:
                 # An idle REPL is blocked in input() and would otherwise sit
                 # at a dead prompt forever -- which leaves an orphaned window
                 # behind when the extender opened the terminal for us.
+                # Whether closing stdin unblocks readline is not something to
+                # rely on, so restore the terminal and exit outright.
                 if not waiters and _prompt["active"]:
                     emit("bg3lua: connection closed by the game", sys.stderr)
-                    try:
-                        os.close(0)  # makes input() raise EOFError
-                    except OSError:
-                        pass
+                    restore_terminal()
+                    os._exit(0)
 
     def _start_reader(self):
         stop_event = threading.Event()
@@ -663,6 +688,7 @@ class BG3Lua:
 
 
 def repl(bg, initial_context):
+    save_terminal()
     context = initial_context
     name = "server" if context == CTX_SERVER else "client"
 
