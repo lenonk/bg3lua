@@ -186,9 +186,44 @@ def restore_terminal():
     except Exception:
         pass
 
+# readline measures the prompt to know which column the input starts in, and it
+# counts every byte it is handed.  A colour escape therefore has to be
+# bracketed with \001..\002 (RL_PROMPT_START_IGNORE / RL_PROMPT_END_IGNORE) or
+# it is counted as visible: "\x1b[34m\x1b[1mserver> \x1b[0m" measures 21
+# columns instead of 8.  The first redraw of a recalled line looks right
+# because it is a full one; every incremental redraw after it starts 13 columns
+# too far right and leaves the tail of the previous line on screen.
+#
+# The bracketed form is only for readline.  emit() writes the prompt to stdout
+# itself, where \001 and \002 are just control characters, so it needs the
+# plain form -- hence two of them.
+RL_IGNORE_START = "\001"
+RL_IGNORE_END = "\002"
+
+
+def prompt_forms(name):
+    """The prompt as (readline form, plain form)."""
+    if not color_enabled(sys.stdout):
+        plain = f"{name}> "
+        return plain, plain
+
+    colour = BLUE if name == "server" else MAGENTA
+    plain = f"{colour}{BOLD}{name}> {RESET}"
+    editable = (f"{RL_IGNORE_START}{colour}{BOLD}{RL_IGNORE_END}"
+                f"{name}> "
+                f"{RL_IGNORE_START}{RESET}{RL_IGNORE_END}")
+    return editable, plain
+
 
 def emit(msg, stream):
-    """Print msg, redrawing the input prompt if one is on screen."""
+    """Print msg, redrawing the input prompt if one is on screen.
+
+    Known limitation: the clear below is \r\x1b[2K, which clears one terminal
+    line.  If the prompt plus the text being edited has wrapped, the wrapped
+    remainder is left on screen.  Fixing that means working out the wrapped
+    row count from the terminal width and clearing upwards, and it has not
+    come up in practice, so it is recorded rather than done.
+    """
     if not msg.endswith("\n"):
         msg += "\n"
     with _output_lock:
@@ -696,17 +731,13 @@ def repl(bg, initial_context):
     print(f"Context: {name}.  :server / :client / :expr CODE / :quit")
 
     while True:
-        if color_enabled(sys.stdout):
-            prompt_color = BLUE if name == "server" else MAGENTA
-            prompt_text = f"{prompt_color}{BOLD}{name}> {RESET}"
-        else:
-            prompt_text = f"{name}> "
+        editable_prompt, plain_prompt = prompt_forms(name)
 
         with _output_lock:
             _prompt["active"] = True
-            _prompt["text"] = prompt_text
+            _prompt["text"] = plain_prompt
         try:
-            line = input(prompt_text)
+            line = input(editable_prompt)
         except EOFError:
             print()
             break
