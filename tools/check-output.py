@@ -17,6 +17,7 @@ occupy.
 Needs neither a terminal nor the game.
 """
 import importlib.util
+import io
 import os
 import sys
 
@@ -76,6 +77,22 @@ def main():
 
     check("newlines and tabs are kept",
           bg.sanitise_output("a\tb\nc"), "a\tb\nc")
+
+    # The highlighter must not touch text that is already coloured: its
+    # tokenizer matches the digits and brackets inside an escape sequence,
+    # and recolouring inside one aborts it.
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    tty = Tty()
+    already = f"{colour}[MCM]: 542 of 1303 [ok]{reset}"
+    check("a coloured line is left alone by the highlighter",
+          bg.highlight_dump(already, tty), already)
+
+    plain = '{"count": 542}'
+    check("a plain dump is still highlighted",
+          bg.highlight_dump(plain, tty) != plain, True)
 
     # Widths: what the terminal advances by, ignoring anything invisible.
     check("colour does not count towards the width",

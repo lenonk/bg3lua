@@ -136,7 +136,20 @@ def color_enabled(stream):
 
 
 def highlight_dump(text, stream=sys.stdout):
+    """Colour a _D()-style dump, unless the sender already coloured it.
+
+    A mod's own line is escape sequences full of digits, colons and brackets
+    -- "\x1b[38;2;0;255;255m" -- and this tokenizer matches every one of
+    them. Recolouring inside a sequence puts an escape in the middle of it,
+    which aborts it and leaves the rest of its body on screen as text: that
+    is where "[38;2;0;255;255;48;2;12;12;12m" and the stray runs after it
+    came from. Highlighting the parts between sequences instead would end
+    the mod's own colour early at every RESET, so text that arrives coloured
+    is left exactly as it is.
+    """
     if not color_enabled(stream):
+        return text
+    if "\x1b" in text:
         return text
 
     def repl(m):
