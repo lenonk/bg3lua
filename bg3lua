@@ -215,26 +215,99 @@ def prompt_forms(name):
     return editable, plain
 
 
-def emit(msg, stream):
-    """Print msg, redrawing the input prompt if one is on screen.
+# Escape sequences, for measuring and for filtering.  CSI covers the colour
+# codes and the cursor moves alike; OSC is the window-title kind, which ends
+# with BEL or ST.
+_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
-    Known limitation: the clear below is \r\x1b[2K, which clears one terminal
-    line.  If the prompt plus the text being edited has wrapped, the wrapped
-    remainder is left on screen.  Fixing that means working out the wrapped
-    row count from the terminal width and clearing upwards, and it has not
-    come up in practice, so it is recorded rather than done.
+
+def visible_width(text):
+    """How many columns text advances the cursor by."""
+    text = _CSI_RE.sub("", text)
+    text = _OSC_RE.sub("", text)
+    text = text.replace(RL_IGNORE_START, "").replace(RL_IGNORE_END, "")
+    return len(text)
+
+
+def sanitise_output(text):
+    r"""Game-side text, made safe to print beside a live prompt.
+
+    Mods colour their own output -- Mod Configuration Menu writes 24-bit SGR
+    codes -- so colour sequences are kept.  Everything else the game might
+    emit goes: a cursor move or an erase would write over the prompt or the
+    line being edited, a bare carriage return would put the rest of the
+    message on top of what came before it, and an escape sequence cut off at
+    the end of a message leaves its tail on screen as text ("542/'" and
+    friends).  Colours are closed off at the end so the prompt that follows
+    is not tinted.
     """
+    out = []
+    coloured = False
+    at = 0
+    while at < len(text):
+        ch = text[at]
+        if ch == "\x1b":
+            csi = _CSI_RE.match(text, at)
+            if csi is not None:
+                if csi.group(0).endswith("m"):
+                    out.append(csi.group(0))
+                    coloured = True
+                at = csi.end()
+                continue
+            osc = _OSC_RE.match(text, at)
+            if osc is not None:
+                at = osc.end()
+                continue
+            # Unterminated: the rest is the inside of a sequence, not text.
+            break
+        if ch in ("\n", "\t"):
+            out.append(ch)
+        elif ch == "\r":
+            pass
+        elif ord(ch) >= 0x20 and ord(ch) != 0x7f:
+            out.append(ch)
+        at += 1
+
+    cleaned = "".join(out)
+    if coloured and not cleaned.endswith(RESET):
+        cleaned += RESET
+    return cleaned
+
+
+def clear_prompt_rows(text):
+    """The sequence that erases a prompt line, wrapped rows included.
+
+    The cursor sits on the last row of what is on screen, so the rows above
+    it are cleared by moving up.  Without this the wrapped remainder of a
+    long line stays behind when output arrives mid-edit.
+    """
+    columns = 0
+    try:
+        columns = os.get_terminal_size(sys.stdout.fileno()).columns
+    except Exception:
+        columns = 0
+    if columns <= 0:
+        columns = 80
+
+    rows = visible_width(text) // columns
+    return "\r\x1b[2K" + "\x1b[A\x1b[2K" * rows
+
+
+def emit(msg, stream):
+    """Print msg, redrawing the input prompt if one is on screen."""
     if not msg.endswith("\n"):
         msg += "\n"
     with _output_lock:
         redraw = _prompt["active"] and color_enabled(sys.stdout)
+        buf = ""
         if redraw:
-            sys.stdout.write("\r\x1b[2K")
+            buf = readline.get_line_buffer() if readline is not None else ""
+            sys.stdout.write(clear_prompt_rows(_prompt["text"] + buf))
             sys.stdout.flush()
         stream.write(msg)
         stream.flush()
         if redraw:
-            buf = readline.get_line_buffer() if readline is not None else ""
             sys.stdout.write(_prompt["text"] + buf)
             sys.stdout.flush()
 
@@ -648,7 +721,7 @@ class BG3Lua:
 
     def _print_debug_output(self, body):
         f = parse_fields(body)
-        msg = decode_text(field_first(f, 1, b""))
+        msg = sanitise_output(decode_text(field_first(f, 1, b"")))
         severity = field_first(f, 2, 0)
         stream = sys.stderr if severity in (1, 2) else sys.stdout
         if severity in (1, 2) and color_enabled(stream):
@@ -728,7 +801,8 @@ def repl(bg, initial_context):
     name = "server" if context == CTX_SERVER else "client"
 
     print(f"Connected to BG3SE Lua debugger (protocol {bg.protocol}).")
-    print(f"Context: {name}.  :server / :client / :expr CODE / :quit")
+    # The commands as the docstring lists them, =CODE included.
+    print(f"Context: {name}. :server / :client / :expr CODE / =CODE / :quit")
 
     while True:
         editable_prompt, plain_prompt = prompt_forms(name)
