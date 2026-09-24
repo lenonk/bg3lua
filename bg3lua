@@ -874,6 +874,8 @@ def main():
                           help="run one line of Lua and exit")
     one_shot.add_argument("-x", "--expression", metavar="LUA",
                           help="evaluate one raw expression and exit")
+    one_shot.add_argument("-f", "--file", metavar="PATH",
+                          help="run a Lua file and exit ('-' for stdin)")
     args = ap.parse_args()
 
     context = CTX_CLIENT if args.client else CTX_SERVER
@@ -892,6 +894,17 @@ def main():
 
         if args.execute is not None:
             return 0 if bg.evaluate(args.execute, context) else 1
+
+        if args.file is not None:
+            # Sent as one chunk, the same as -e. The alternative -- having the
+            # game open the file -- would run it in whatever directory the
+            # game is in and would not work for a file the game cannot read.
+            if args.file == "-":
+                code = sys.stdin.read()
+            else:
+                with open(args.file, encoding="utf-8") as f:
+                    code = f.read()
+            return 0 if bg.evaluate(code, context) else 1
 
         if args.expression is not None:
             return 0 if bg.evaluate(args.expression, context, raw_expression=True) else 1
